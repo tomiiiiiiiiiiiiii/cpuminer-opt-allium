@@ -1,0 +1,143 @@
+name: Windows x64 Allium builds
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Windows x64 (${{ matrix.variant }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: sse2
+            cflags: -O3 -march=x86-64 -msse2 -Wall
+          - variant: avx2
+            cflags: -O3 -march=haswell -maes -Wall
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 / MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            autoconf
+            automake
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-gmp
+            mingw-w64-x86_64-jansson
+            mingw-w64-x86_64-zlib
+
+      - name: Configure
+        env:
+          CFLAGS: ${{ matrix.cflags }}
+        run: |
+          set -euo pipefail
+          ./autogen.sh
+          ./configure --with-curl=/mingw64
+
+      - name: Compile
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)"
+          test -s cpuminer.exe
+
+      - name: Smoke-test executable
+        run: |
+          set -euo pipefail
+          ./cpuminer.exe --help > /dev/null
+          ./cpuminer.exe --version
+
+      - name: Package EXE and required MinGW DLLs
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          package="cpuminer-opt-allium-windows-x64-$VARIANT"
+          dest="dist/$package"
+          mkdir -p "$dest"
+          cp cpuminer.exe README.md COPYING "$dest/"
+
+          # Inspect recursive PE imports. Windows system DLLs are already
+          # available; copy only DLLs supplied by the MinGW environment.
+          collect_dependencies() {
+            local binary="$1"
+            local dependency=""
+            local dll=""
+            while IFS= read -r dependency; do
+              dll="$(find /mingw64/bin -maxdepth 1 -type f -iname "$dependency" -print -quit)"
+              if [[ -n "$dll" && ! -e "$dest/$dependency" ]]; then
+                cp "$dll" "$dest/"
+                collect_dependencies "$dll"
+              fi
+            done < <(objdump -p "$binary" | sed -n 's/^[[:space:]]*DLL Name: //p')
+          }
+          collect_dependencies cpuminer.exe
+
+          cat > "$dest/START-HERE.txt" <<'EOF'
+          Garlicoin (Allium) CPU miner for Windows x64
+          
+          Run in Command Prompt, replacing pool details and wallet:
+          
+          cpuminer.exe -a allium -o stratum+tcp://POOL:PORT -u WALLET.WORKER -p x
+          
+          Versions:
+          - sse2: baseline x86-64 CPUs with SSE2 support.
+          - avx2: CPUs supporting AVX2 and AES-NI (e.g. Intel Haswell+).
+          
+          Use only the version supported by your processor.
+          DLL files in this directory must stay beside cpuminer.exe.
+          Miners may trigger antivirus warnings; inspect the source if unsure.
+          EOF
+          test -s "$dest/cpuminer.exe"
+          echo "Packaged files:"
+          ls -lh "$dest"
+
+      - name: Verify packaged executable runs without MSYS2 on PATH
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "dist/cpuminer-opt-allium-windows-x64-${{ matrix.variant }}/cpuminer.exe").Path
+          $oldPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            & $exe --help | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaged miner failed to start; exit code: $LASTEXITCODE"
+            }
+          }
+          finally {
+            $env:PATH = $oldPath
+          }
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          $name = "cpuminer-opt-allium-windows-x64-${{ matrix.variant }}"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          Get-FileHash -Algorithm SHA256 "dist/$name.zip" | Format-List
+
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpuminer-opt-allium-windows-x64-${{ matrix.variant }}
+          path: dist/cpuminer-opt-allium-windows-x64-${{ matrix.variant }}.zip
+          if-no-files-found: error
+          retention-days: 30
